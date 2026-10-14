@@ -158,6 +158,11 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<QwenTargetPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // When not 0, 0 < snapshotRow < rows: every GDN layer also stores its state
+  // after that many of the sequence's rows into the snapshot cells.
+  uint32_t snapshotRow = 0;
+  std::span<const metal::MetalBuffer> convolutionSnapshot;
+  std::span<const metal::MetalBuffer> recurrentSnapshot;
 };
 
 struct QwenTargetPrefillBuffers final {

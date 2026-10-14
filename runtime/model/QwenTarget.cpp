@@ -201,6 +201,12 @@ metal::MetalBuffer QwenTarget::addPrefill(
         sequence.recurrentOut.size() != geometry_.stateLayout.layers) {
       throw std::invalid_argument("Qwen prefill state layer mismatch");
     }
+    if (sequence.snapshotRow &&
+        (sequence.snapshotRow >= sequence.rows ||
+         sequence.convolutionSnapshot.size() != geometry_.stateLayout.layers ||
+         sequence.recurrentSnapshot.size() != geometry_.stateLayout.layers)) {
+      throw std::invalid_argument("invalid Qwen prefill state snapshot");
+    }
   }
   PrefillStep step{graph, buffers, sequences, rows, kvLayers};
   for (const QwenTargetPrefillSequence &sequence : sequences)
@@ -255,6 +261,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
     const auto f32 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<float>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
     };
+    const bool snapshot = sequence.snapshotRow != 0;
     ops::GDN::addPrefill(
         step.graph,
         {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],
@@ -262,7 +269,9 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
          u16(b.gdnKeys, geometry_.gdnKeyWidth()), u16(b.gdnValues, geometry_.attentionWidth), mixer.decay,
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
-         mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
+         mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth), sequence.snapshotRow,
+         snapshot ? sequence.convolutionSnapshot[layer] : metal::MetalBuffer{},
+         snapshot ? sequence.recurrentSnapshot[layer] : metal::MetalBuffer{}},
         geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder);
   }
   addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput);

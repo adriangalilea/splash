@@ -22,7 +22,8 @@ inline void gdn_scan_prefill_phase(
     device const bfloat *q, device const bfloat *k, device const bfloat *v,
     device const float *decay, device const bfloat *beta,
     device const State *state_in, device State *state_out,
-    device bfloat *output, uint tokens, threadgroup float *keys,
+    device State *state_snapshot, device bfloat *output, uint tokens,
+    uint snapshot_row, threadgroup float *keys,
     threadgroup float *queries, threadgroup float *values,
     threadgroup float *gates, uint group, uint thread_index, uint lane,
     uint simd_group) {
@@ -148,6 +149,15 @@ inline void gdn_scan_prefill_phase(
         output[(ulong(start + t) * ValueHeads + value_head) * HeadDim +
                row_base + row] = bfloat(result);
       }
+      // The state after snapshot_row rows, stored as that chunk's state_out
+      // would be; the registers carry on unchanged.
+      if (start + t + 1 == snapshot_row) {
+        for (uint c = 0; c < Columns / 4; ++c) {
+          reinterpret_cast<device vec<State, 4> *>(state_snapshot +
+                                                   state_base)[c] =
+              vec<State, 4>(state[c]);
+        }
+      }
     }
     if (more) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -171,7 +181,8 @@ inline void gdn_scan_prefill_phase(
       device const State *state_in [[buffer(5)]],                             \
       device State *state_out [[buffer(6)]],                                  \
       device bfloat *output [[buffer(7)]],                                    \
-      constant GDNPrefillParams &params [[buffer(8)]],                        \
+      device State *state_snapshot [[buffer(8)]],                             \
+      constant GDNPrefillParams &params [[buffer(9)]],                        \
       uint group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
@@ -181,8 +192,9 @@ inline void gdn_scan_prefill_phase(
     threadgroup float values[GdnScanBlock * SPLASH_GDN_SCAN_STATE_ROWS];    \
     threadgroup float gates[2 * GdnScanBlock];                                \
     gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim, State>(             \
-        q, k, v, decay, beta, state_in, state_out, output, params.tokens,     \
-        keys, queries, values, gates, group, thread_index, lane, simd_group); \
+        q, k, v, decay, beta, state_in, state_out, state_snapshot, output,    \
+        params.tokens, params.snapshot_row, keys, queries, values, gates,     \
+        group, thread_index, lane, simd_group);                               \
   }
 // Each geometry's scan over an fp32 state and, as Name_bf16_state, a bf16 one.
 #define GDN_SCAN_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim)            \
@@ -205,7 +217,7 @@ inline void gdn_prepare_prefill_phase(
     device const bfloat *conv_state_in, device bfloat *conv_state_out,
     device bfloat *q, device bfloat *k, device bfloat *v,
     device const float *a_scale, device const bfloat *dt_bias,
-    device float *decay, device bfloat *beta,
+    device float *decay, device bfloat *beta, device bfloat *conv_snapshot,
     constant GDNPrefillParams &params, threadgroup float *reductions,
     uint task, uint thread_index, uint lane, uint simd_group) {
   constexpr uint KeyWidth = KeyHeads * HeadDim;
@@ -266,12 +278,16 @@ inline void gdn_prepare_prefill_phase(
   if (token == 0) {
     const GdnConvHistory carry{conv_state_in, packed, ConvDim, PackedWidth,
                                params.tokens};
+    const GdnConvHistory snapshot{conv_state_in, packed, ConvDim, PackedWidth,
+                                  params.snapshot_row};
     for (uint row = 0; row < SPLASH_GDN_CONVOLUTION_TAPS - 1; ++row) {
       for (uint head = 0; head < HeadsPerKey + 2; ++head) {
         const uint channel = head == 0   ? query_channel
                              : head == 1 ? key_channel
                                          : value_channel + (head - 2) * HeadDim;
         conv_state_out[row * ConvDim + channel] = carry.at(row, channel);
+        if (params.snapshot_row)
+          conv_snapshot[row * ConvDim + channel] = snapshot.at(row, channel);
       }
     }
   }
@@ -289,7 +305,8 @@ inline void gdn_prepare_prefill_phase(
       device const float *a_scale [[buffer(7)]],                              \
       device const bfloat *dt_bias [[buffer(8)]],                             \
       device float *decay [[buffer(9)]], device bfloat *beta [[buffer(10)]],  \
-      constant GDNPrefillParams &params [[buffer(11)]],                       \
+      device bfloat *conv_snapshot [[buffer(11)]],                            \
+      constant GDNPrefillParams &params [[buffer(12)]],                       \
       uint task [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
@@ -298,8 +315,8 @@ inline void gdn_prepare_prefill_phase(
     gdn_prepare_prefill_phase<KeyHeads, ValueHeads, HeadDim, ConvDim,         \
                               PackedWidth>(                                   \
         packed, conv_weights, conv_state_in, conv_state_out, q, k, v, a_scale,\
-        dt_bias, decay, beta, params, reductions, task, thread_index, lane,   \
-        simd_group);                                                          \
+        dt_bias, decay, beta, conv_snapshot, params, reductions, task,        \
+        thread_index, lane, simd_group);                                      \
   }
 
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240, 16640)

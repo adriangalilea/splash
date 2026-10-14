@@ -19,13 +19,17 @@
 // tasks; the state cells' strides and a decode step's tape offsets come from
 // the host.
 
-// The prefill prepare and scan kernels.
+// The prefill prepare and scan kernels. snapshot_row, when not 0, is a row
+// count 0 < snapshot_row < tokens: the kernels also store the state after
+// that many rows (the convolution carry and the recurrent state an
+// snapshot_row-token chunk would leave) into their snapshot buffers.
 struct GDNPrefillParams {
   uint32_t tokens;
+  uint32_t snapshot_row;
 };
 
-static_assert(sizeof(GDNPrefillParams) == 4,
-              "GDN prefill parameters are 4 bytes on both sides");
+static_assert(sizeof(GDNPrefillParams) == 8,
+              "GDN prefill parameters are 8 bytes on both sides");
 
 // tiled_heads (0 or 1) selects the value-head order of the GDN output, the
 // out_proj input columns: 0 keeps a key head's value heads adjacent (head h

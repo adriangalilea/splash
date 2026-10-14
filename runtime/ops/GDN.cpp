@@ -114,13 +114,26 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   requireBytes(buffers.recurrentOut, recurrentBytes(shape, state), "GDN next recurrent state");
   requireBytes(buffers.recurrentRows, valueRows, "GDN recurrent row");
   requireBytes(buffers.hidden, valueRows, "GDN hidden");
-  const GDNPrefillParams params{tokens};
+  if (buffers.snapshotRow >= tokens)
+    throw std::invalid_argument("invalid GDN prefill snapshot row");
+  // Without a snapshot the kernels never write their snapshot buffers; the
+  // out buffers stand in for them.
+  metal::MetalBuffer convolutionSnapshot = buffers.convolutionOut;
+  metal::MetalBuffer recurrentSnapshot = buffers.recurrentOut;
+  if (buffers.snapshotRow) {
+    requireBytes(buffers.convolutionSnapshot, carriedBytes(shape), "GDN convolution snapshot");
+    requireBytes(buffers.recurrentSnapshot, recurrentBytes(shape, state), "GDN recurrent snapshot");
+    convolutionSnapshot = buffers.convolutionSnapshot;
+    recurrentSnapshot = buffers.recurrentSnapshot;
+  }
+  const GDNPrefillParams params{tokens, buffers.snapshotRow};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
             {buffers.packed, buffers.convolutionWeights,
              buffers.convolutionIn, buffers.convolutionOut, buffers.queries,
              buffers.keys, buffers.values, buffers.decayWeights,
-             buffers.timeBias, buffers.decay, buffers.beta},
+             buffers.timeBias, buffers.decay, buffers.beta,
+             std::move(convolutionSnapshot)},
             params, {uint64_t{tokens} * shape.keyHeads, 1, 1},
             {shape.headDimension, 1, 1});
   graph.add(stateKernel(kernelName(kernel, "prefill_gdn_scan",
@@ -128,7 +141,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
                         state),
             {buffers.queries, buffers.keys, buffers.values, buffers.decay,
              buffers.beta, buffers.recurrentIn, buffers.recurrentOut,
-             buffers.recurrentRows},
+             buffers.recurrentRows, std::move(recurrentSnapshot)},
             params,
             {uint64_t{shape.valueHeads} * shape.headDimension /
                  SPLASH_GDN_SCAN_STATE_ROWS,

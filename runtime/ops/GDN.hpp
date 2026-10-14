@@ -87,6 +87,12 @@ struct GdnPrefillBuffers final {
   metal::MetalBuffer recurrentRows;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
+  // When not 0, a row count 0 < snapshotRow < tokens: the state after that
+  // many rows is also stored into convolutionSnapshot and recurrentSnapshot,
+  // byte for byte what a snapshotRow-token prefill leaves in the out buffers.
+  uint32_t snapshotRow = 0;
+  metal::MetalBuffer convolutionSnapshot;
+  metal::MetalBuffer recurrentSnapshot;
 };
 
 // A lane's decode tape (metal/abi/GDN.h): each step leaves its rows'

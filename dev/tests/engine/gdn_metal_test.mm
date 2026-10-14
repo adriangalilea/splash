@@ -21,8 +21,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -136,7 +138,10 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
           shared(backend, stateBytes, "state out"),
           shared(backend, uint64_t{tokens} * valueWidth * 2, "recurrent rows"),
           std::move(mixerNorm),
-          shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden")};
+          shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden"),
+          0,
+          {},
+          {}};
 }
 
 // The mixer norm is bf16, or F32 as a GGUF stores it.
@@ -462,6 +467,96 @@ void runSplitCase(MetalBackend &backend, const GdnShape &shape,
   std::cout << label << "byte-identical to the single pass\n";
 }
 
+// A prefill of `tokens` rows with a snapshot at row `row` stores, into its
+// snapshot buffers, the convolution carry and recurrent state a prefill of
+// the first `row` rows leaves in its out buffers, byte for byte, and its own
+// outputs are those of the prefill without a snapshot, byte for byte. Row
+// counts on and off the sixteen-token scan block, in either state format.
+void runSnapshotCase(MetalBackend &backend, const GdnShape &shape,
+                     uint32_t tokens, uint32_t row, GdnStateFormat format) {
+  const std::string label = "vh" + std::to_string(shape.valueHeads) +
+                            " tokens=" + std::to_string(tokens) +
+                            " snapshot=" + std::to_string(row) + " " +
+                            std::string(splash::ops::formatName(format)) +
+                            " state: ";
+  const uint64_t rowBytes = uint64_t{shape.packedWidth} * 2;
+  const uint64_t stateBytes = uint64_t{shape.valueHeads} * kHeadDim * kHeadDim *
+                              splash::ops::elementBytes(format);
+  GdnPrefillBuffers plain = randomPrefill(backend, shape, tokens);
+  if (format == GdnStateFormat::BFloat16) {
+    const uint64_t elements = plain.recurrentIn.sizeBytes() / 4;
+    MetalBuffer narrow = shared(backend, elements * 2, "bf16 state in");
+    for (uint64_t i = 0; i < elements; ++i)
+      data<uint16_t>(narrow)[i] = toBf16(data<float>(plain.recurrentIn)[i]);
+    plain.recurrentIn = narrow;
+  }
+  const auto like = [&](uint32_t rows, MetalBuffer packed) {
+    return prefillBuffers(backend, shape, rows, std::move(packed),
+                          plain.convolutionIn, plain.recurrentIn,
+                          plain.convolutionWeights, plain.decayWeights,
+                          plain.timeBias, plain.mixerNorm);
+  };
+  GdnPrefillBuffers prefix = like(row, backend.view(plain.packed, 0, row * rowBytes));
+  GdnPrefillBuffers captured = like(tokens, plain.packed);
+  captured.snapshotRow = row;
+  captured.convolutionSnapshot =
+      shared(backend, plain.convolutionOut.sizeBytes(), "conv snapshot");
+  captured.recurrentSnapshot = shared(backend, stateBytes, "state snapshot");
+  for (GdnPrefillBuffers *buffers : {&plain, &prefix, &captured})
+    submitPrefill(backend, *buffers, shape, buffers == &prefix ? row : tokens,
+                  label, GdnHeadOrder::Grouped, format);
+
+  requireSameBytes(captured.convolutionSnapshot, prefix.convolutionOut, 0,
+                   prefix.convolutionOut.sizeBytes(),
+                   label + "convolution snapshot differs from the prefix's carry");
+  requireSameBytes(captured.recurrentSnapshot, prefix.recurrentOut, 0, stateBytes,
+                   label + "recurrent snapshot differs from the prefix's state");
+  for (const auto &[member, what] :
+       std::initializer_list<std::pair<MetalBuffer GdnPrefillBuffers::*, const char *>>{
+           {&GdnPrefillBuffers::convolutionOut, "convolution carry"},
+           {&GdnPrefillBuffers::queries, "queries"},
+           {&GdnPrefillBuffers::keys, "keys"},
+           {&GdnPrefillBuffers::values, "values"},
+           {&GdnPrefillBuffers::decay, "decay"},
+           {&GdnPrefillBuffers::beta, "beta"},
+           {&GdnPrefillBuffers::recurrentRows, "recurrent rows"},
+           {&GdnPrefillBuffers::hidden, "hidden rows"}})
+    requireSameBytes(captured.*member, plain.*member, 0, (plain.*member).sizeBytes(),
+                     label + what + " differ with a snapshot");
+  requireSameBytes(captured.recurrentOut, plain.recurrentOut, 0, stateBytes,
+                   label + "recurrent state differs with a snapshot");
+  std::cout << label << "the prefix's carry and state, outputs unchanged\n";
+}
+
+// A snapshot row must lie inside the chunk, and its buffers must hold a
+// state of the chunk's format.
+void snapshotExtents(MetalBackend &backend, const GdnShape &shape) {
+  constexpr uint32_t tokens = 37;
+  const GdnPrefillBuffers buffers = randomPrefill(backend, shape, tokens);
+  const uint64_t carried = buffers.convolutionOut.sizeBytes();
+  const uint64_t state = uint64_t{shape.valueHeads} * kHeadDim * kHeadDim * 4;
+  const auto refused = [&](uint32_t row, uint64_t convolution, uint64_t recurrent) {
+    GdnPrefillBuffers changed = buffers;
+    changed.snapshotRow = row;
+    changed.convolutionSnapshot = shared(backend, convolution, "conv snapshot");
+    changed.recurrentSnapshot = shared(backend, recurrent, "state snapshot");
+    CommandGraph graph;
+    try {
+      GDN::addPrefill(graph, changed, shape, tokens, GdnStateFormat::Float32,
+                      GdnHeadOrder::Grouped);
+    } catch (const std::invalid_argument &) {
+      return true;
+    }
+    return false;
+  };
+  require(!refused(1, carried, state) && !refused(tokens - 1, carried, state),
+          "a snapshot inside the chunk was refused");
+  require(refused(tokens, carried, state) && refused(tokens + 1, carried, state),
+          "a snapshot at or past the chunk's end was encoded");
+  require(refused(1, carried - 2, state) && refused(1, carried, state - 4),
+          "a snapshot into a short buffer was encoded");
+}
+
 // A bf16 state's scan computes as the fp32 state's does: from the same state,
 // whose values bf16 holds, its recurrent and hidden rows are the fp32 scan's
 // byte for byte, and the state it stores is the fp32 scan's rounded to
@@ -607,6 +702,10 @@ void run(const std::string &metallib) {
       runCase(backend, shape, tokens, true);
     runSplitCase(backend, shape, 2048, 1000);
     runSplitCase(backend, shape, 37, 17);
+    snapshotExtents(backend, shape);
+    for (const GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+      for (uint32_t row : {1u, 15u, 16u, 17u, 288u, 299u})
+        runSnapshotCase(backend, shape, 300, row, format);
     for (uint32_t tokens : {1u, 37u, 1000u})
       runTiledCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u, 1000u})

@@ -1011,7 +1011,10 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
                             buffer(stateBytes),
                             buffer(valueRows),
                             fixture.mixerNorm,
-                            buffer(valueRows)};
+                            buffer(valueRows),
+                            0,
+                            {},
+                            {}};
   for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
     const std::string where = what + " lane " + std::to_string(lane);
     prefill.packed = backend.view(fixture.packed, uint64_t{lane} * fixture.packedStride * 2,
