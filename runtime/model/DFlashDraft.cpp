@@ -2,7 +2,9 @@
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
 #include "metal/abi/DraftAttention.h"
+#include "ops/RowCopy.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -136,10 +138,31 @@ void DFlashDraft::addContextPrefill(
   ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
                              rows);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
-  for (const DFlashPrefillSpan &span : spans)
+  const auto store = [&](const DFlashPrefillSpan &span, uint32_t begin, uint32_t end) {
+    if (begin == end)
+      return;
     ops::DraftAttention::addWindowStore(
-        graph, backend_.view(buffers.hidden, span.compactRow * rowBytes, span.rows * rowBytes),
-        span.window, span.rows, span.startPosition, layout.hiddenSize);
+        graph,
+        backend_.view(buffers.hidden, (span.compactRow + begin - span.startPosition) * rowBytes,
+                      uint64_t{end - begin} * rowBytes),
+        span.window, end - begin, begin, layout.hiddenSize);
+  };
+  for (const DFlashPrefillSpan &span : spans) {
+    const uint32_t end = span.startPosition + span.rows;
+    if (!span.windowSnapshot) {
+      store(span, span.startPosition, end);
+      continue;
+    }
+    const uint32_t split = std::clamp(span.snapshotPosition, span.startPosition, end);
+    const uint64_t bytes = span.windowSnapshot.sizeBytes();
+    if (bytes != span.window.sizeBytes() || bytes % sizeof(uint16_t))
+      throw std::invalid_argument("draft window snapshot does not match the window");
+    store(span, span.startPosition, split);
+    // The window's bytes, codes and scales alike, as one row.
+    ops::RowCopy::add(graph, span.window, {0, static_cast<uint32_t>(bytes / 2), 0}, span.windowSnapshot,
+                      {0, static_cast<uint32_t>(bytes / 2), 0}, 1, static_cast<uint32_t>(bytes / 2));
+    store(span, split, end);
+  }
   addContextKv(graph, buffers, rows, spans);
 }
 
@@ -155,7 +178,7 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
                                      layout.hiddenSize);
-  const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
+  const DFlashPrefillSpan span{0, rows, startPosition, ring, window, {}, 0};
   addContextKv(graph, buffers, rows, {&span, 1});
 }
 

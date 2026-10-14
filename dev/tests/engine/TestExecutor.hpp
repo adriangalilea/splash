@@ -245,6 +245,7 @@ public:
     if (!entry.resident)
       throw std::logic_error("request is already suspended");
     pageTables.erase(id);
+    dropCapturedState(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -310,6 +311,19 @@ public:
         }
       }
       Request &state = requests.at(item.requestId);
+      if (item.stateCapture) {
+        const auto held = heldCaptures.find(item.requestId);
+        if (held == heldCaptures.end() || held->second.tokens != item.stateCapture ||
+            item.stateCapture <= item.logicalPosition ||
+            item.stateCapture >= item.logicalPosition + item.tokenCount)
+          throw std::logic_error("ragged prefill state capture was not prepared inside the chunk");
+        capturedChunks.push_back({item.requestId, item.logicalPosition, item.tokenCount,
+                                  static_cast<uint32_t>(item.stateCapture)});
+        if (nonFinitePrefills.contains(item.requestId))
+          dropCapturedState(item.requestId);
+        else
+          held->second.written = true;
+      }
       if (nonFinitePrefills.contains(item.requestId)) {
         // The chunk commits nothing; the engine ends the request.
         result.push_back({.requestId = item.requestId,
@@ -477,6 +491,37 @@ public:
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
   }
+  // In-place capture as the production runtime takes it: one per request,
+  // past its position on a page, until the chunk that writes it completes;
+  // a chunk whose rows are not finite drops it. Off unless `captures`; the
+  // next `deniedCaptures` preparations are refused.
+  bool capturesStateInPlace() const noexcept override { return captures; }
+  bool prepareStateCapture(uint64_t id, uint32_t tokens) override {
+    if (!captures)
+      throw std::logic_error("a model that does not capture was asked to");
+    if (deniedCaptures) {
+      --deniedCaptures;
+      return false;
+    }
+    const Request &entry = requests.at(id);
+    if (!entry.resident || heldCaptures.contains(id) || tokens <= entry.position ||
+        tokens % engine::KvCache::pageTokens)
+      throw std::logic_error("a capture was prepared where the runtime takes none");
+    heldCaptures[id] = {tokens, false};
+    ++capturesPrepared;
+    return true;
+  }
+  std::shared_ptr<const CompositeState> takeCapturedState(uint64_t id) override {
+    const auto found = heldCaptures.find(id);
+    if (found == heldCaptures.end() || !found->second.written)
+      throw std::logic_error("no prefill has written the Qwen state capture");
+    heldCaptures.erase(found);
+    ++capturesTaken;
+    return std::make_shared<State>(evictedStateBytes);
+  }
+  void dropCapturedState(uint64_t id) override {
+    capturesDropped += heldCaptures.erase(id);
+  }
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
@@ -522,6 +567,7 @@ public:
     return std::nullopt;
   }
   void end(uint64_t id) override {
+    dropCapturedState(id);
     requests.erase(id);
     pageTables.erase(id);
   }
@@ -661,6 +707,25 @@ public:
   uint32_t decodeTokens = 1;
   // The masks the model took.
   uint32_t providedMasks = 0;
+  bool captures = false;
+  uint32_t deniedCaptures = 0;
+  struct HeldCapture {
+    uint32_t tokens = 0;
+    bool written = false;
+  };
+  std::unordered_map<uint64_t, HeldCapture> heldCaptures;
+  // Every prefill chunk that carried a capture: request, position, rows and
+  // the captured boundary.
+  struct CapturedChunk {
+    uint64_t requestId = 0;
+    uint64_t position = 0;
+    uint32_t rows = 0;
+    uint32_t boundary = 0;
+  };
+  std::vector<CapturedChunk> capturedChunks;
+  uint32_t capturesPrepared = 0;
+  uint32_t capturesTaken = 0;
+  uint32_t capturesDropped = 0;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {

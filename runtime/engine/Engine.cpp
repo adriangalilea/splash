@@ -1033,11 +1033,22 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
 
 void Engine::armNextStateBoundary(Request &active) {
   const std::optional<uint32_t> next =
-      active.stateBoundaryCursor < active.stateBoundaries.size()
+      active.stateBoundaryCursor < active.stateBoundaries.size() && !capturableBoundary(active)
           ? std::optional<uint32_t>(
                 active.stateBoundaries[active.stateBoundaryCursor].tokens)
           : std::nullopt;
   scheduler_.setPrefillBoundary(active.request.id, next);
+}
+
+std::optional<uint32_t> Engine::capturableBoundary(const Request &active) const {
+  if (!config_.inPlaceStateCapture || !model_.capturesStateInPlace() ||
+      active.stateBoundaryCursor + 1 != active.stateBoundaries.size())
+    return std::nullopt;
+  const Request::StateBoundary &next = active.stateBoundaries[active.stateBoundaryCursor];
+  if (next.disposable || active.replayTokens != active.promptTokens ||
+      next.tokens != promptReplayBoundary(active))
+    return std::nullopt;
+  return next.tokens;
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {
@@ -1095,8 +1106,10 @@ void Engine::publishReachedStateBoundaries(Request &active,
                              : replay   ? counters_.replayStatePublications
                                         : counters_.junctionMaterializations;
     // The scheduler ends a command exactly at an armed boundary
-    // (Scheduler::planPrefill).
-    if (objective.tokens != promptProcessed)
+    // (Scheduler::planPrefill); a command crosses only the boundary it
+    // captured in place.
+    const bool captured = objective.tokens != promptProcessed;
+    if (captured && objective.tokens != std::exchange(active.stateCapture, 0))
       throw std::logic_error("prefill crossed an armed state boundary");
     materialized = true;
     const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
@@ -1106,6 +1119,12 @@ void Engine::publishReachedStateBoundaries(Request &active,
       active.replayPoint = cache_.useState(block);
     if (cache_.reuseCompositeState(block, checkpoint)) {
       ++counters_.deduplicatedStatePublications;
+    } else if (captured) {
+      // The command wrote the state into buffers taken for it beforehand.
+      cache_.publishCompositeState(block, model_.takeCapturedState(active.request.id),
+                                   checkpoint);
+      ++counters_.inPlaceStatePublications;
+      ++publications;
     } else {
       // The previous recovery point retires here or after the publication.
       // Here, before the snapshot, a resident one hands its buffers to its
@@ -1236,12 +1255,24 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
       continue;
     }
     admitted.push_back(scheduled);
+    // A chunk that crosses a capturable boundary captures it in place, or,
+    // when the model cannot, ends there as an armed boundary's chunk does.
+    if (plan.kind == WorkKind::Prefill) {
+      const std::optional<uint32_t> boundary = capturableBoundary(active);
+      if (boundary && position < *boundary && *boundary < workEnd) {
+        if (model_.prepareStateCapture(active.request.id, *boundary))
+          active.stateCapture = *boundary;
+        else
+          admitted.back().tokenCount = static_cast<uint32_t>(*boundary - position);
+      }
+    }
     // A lane that runs is waiting for nothing.
     active.resourceWait = {};
     ModelBatchItem item;
     item.requestId = active.request.id;
     item.logicalPosition = position;
-    item.tokenCount = scheduled.tokenCount;
+    item.tokenCount = admitted.back().tokenCount;
+    item.stateCapture = active.stateCapture;
     const PageTableView pageTable = cache_.pageTable(active.request.id);
     item.pageTable = pageTable.pages;
     item.pageTableRevision = pageTable.revision;
@@ -1249,7 +1280,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan,
     if (plan.kind == WorkKind::Prefill) {
       item.inputTokens =
           std::span<const uint32_t>(active.exactTokens)
-              .subspan(scheduled.promptOffset, scheduled.tokenCount);
+              .subspan(scheduled.promptOffset, item.tokenCount);
     }
     items.push_back(std::move(item));
   }
@@ -1647,6 +1678,8 @@ void Engine::apply(const BatchPlan &plan,
       // writes remain invisible, but a cancelled, deadline-expired or
       // model-rejected request must not publish cache state or emit output
       // when that command drains.
+      if (std::exchange(active.stateCapture, 0))
+        model_.dropCapturedState(active.request.id);
       schedulerResults.push_back({active.request.id,
                                   result.consumedPromptTokens, true,
                                   result.nextDecodeStage});
@@ -1664,7 +1697,12 @@ void Engine::apply(const BatchPlan &plan,
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
       publishCommittedBlocks(active, promptProcessed);
+      const bool capturing = active.stateCapture != 0;
       publishReachedStateBoundaries(active, promptProcessed, now);
+      // A capture the publication did not take, the state being cached
+      // already, goes back to the pool.
+      if (capturing)
+        model_.dropCapturedState(active.request.id);
       // Recovery may replay an already reported prefix, including generated
       // history.
       const uint32_t processed = std::min(promptProcessed, active.promptTokens);

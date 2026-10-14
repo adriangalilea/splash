@@ -644,6 +644,109 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
           "request lifecycle did not complete cleanly");
 }
 
+// A model that captures states in place takes the prompt's replay state in
+// the command that crosses it: one command for the whole prompt, no
+// snapshot, and the next request resumes from the captured state. Where the
+// model refuses the capture, or the engine is configured not to ask, the
+// command ends at the boundary as before.
+void testReplayStateIsCapturedInPlace() {
+  std::vector<uint32_t> prompt(65);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  const auto run = [&](bool inPlace, uint32_t deniedCaptures) {
+    struct Outcome {
+      uint32_t firstChunks, secondChunks, snapshots, prepared, taken, dropped, restored, prefillRows;
+      uint64_t inPlacePublications, replayPublications;
+      std::vector<Executor::CapturedChunk> captured;
+    };
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor;
+    executor.captures = true;
+    executor.deniedCaptures = deniedCaptures;
+    Events events;
+    engine::Engine engine(test::engineConfig({.inPlaceStateCapture = inPlace}), resources, executor,
+                          events);
+    guardReleases(storage, engine);
+    engine.submit(request(1, prompt));
+    runUntilIdle(engine);
+    engine.submit(request(2, prompt));
+    runUntilIdle(engine);
+    require(events.completedCount == 2 && events.failedCount == 0 && executor.heldCaptures.empty(),
+            "an in-place capture run did not complete cleanly");
+    const auto snapshot = engine.snapshot();
+    return Outcome{executor.prefillChunks[1], executor.prefillChunks[2], executor.snapshots,
+                   executor.capturesPrepared, executor.capturesTaken, executor.capturesDropped,
+                   executor.restored, executor.prefillRows, snapshot.inPlaceStatePublications,
+                   snapshot.replayStatePublications, executor.capturedChunks};
+  };
+
+  const auto captured = run(true, 0);
+  require(captured.firstChunks == 1 && captured.snapshots == 0 && captured.prepared == 1 &&
+              captured.taken == 1 && captured.dropped == 0 &&
+              captured.inPlacePublications == 1 && captured.replayPublications == 1,
+          "the replay state was not captured in the one command that crossed it");
+  require(captured.captured.size() == 1 && captured.captured[0].requestId == 1 &&
+              captured.captured[0].position == 0 && captured.captured[0].rows == 65 &&
+              captured.captured[0].boundary == 64,
+          "the capturing command was not the whole prompt with its boundary");
+  require(captured.restored == 64 && captured.secondChunks == 1 && captured.prefillRows == 66,
+          "the next request did not resume from the captured state");
+
+  for (const auto &[outcome, why] : {std::pair{run(true, 1), "a refused capture"},
+                                     std::pair{run(false, 0), "a disabled capture"}}) {
+    require(outcome.firstChunks == 2 && outcome.snapshots == 1 && outcome.taken == 0 &&
+                outcome.inPlacePublications == 0 && outcome.replayPublications == 1 &&
+                outcome.captured.empty() && outcome.restored == 64,
+            std::string(why) + " did not end the command at the boundary");
+  }
+}
+
+// A capture the command wrote but nothing publishes goes back to the model:
+// a request cancelled while its capturing command runs, and one whose rows
+// are not finite.
+void testUnpublishedCapturesAreDropped() {
+  std::vector<uint32_t> prompt(65);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  {
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor;
+    executor.captures = true;
+    executor.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+    engine.submit(request(1, prompt));
+    require(engine.tick(1) && engine.commandInFlight() && executor.heldCaptures.contains(1),
+            "the capturing command did not stay in flight");
+    engine.cancel(1);
+    *executor.holdPrefillUntil = true;
+    runUntilIdle(engine);
+    require(executor.capturesDropped == 1 && executor.capturesTaken == 0 &&
+                executor.heldCaptures.empty() && engine.snapshot().inPlaceStatePublications == 0 &&
+                engine.snapshot().cancelled == 1,
+            "a cancelled request's capture was published or kept");
+  }
+  {
+    test::TestKvStorage storage(32, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor;
+    executor.captures = true;
+    executor.nonFinitePrefills.insert(1);
+    Events events;
+    engine::Engine engine(test::engineConfig(), resources, executor, events);
+    guardReleases(storage, engine);
+    engine.submit(request(1, prompt));
+    runUntilIdle(engine);
+    require(executor.capturesDropped == 1 && executor.heldCaptures.empty() &&
+                engine.snapshot().inPlaceStatePublications == 0 && events.failedCount == 1,
+            "a capture of rows that are not finite was published or kept");
+  }
+}
+
 void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
@@ -9309,6 +9412,8 @@ int main() {
     testIncompleteConfigIsRefused();
     testColdPublishesReplayStateAndRebuildsALostOne();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
+    testReplayStateIsCapturedInPlace();
+    testUnpublishedCapturesAreDropped();
     testReplayStateEndsBeforeTheGenerationPrompt();
     testFollowUpResumesBeforeTheGenerationPrompt();
     testRetryPublishesNoStateInsideTheGenerationPrompt();

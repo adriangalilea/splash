@@ -876,6 +876,126 @@ void requireFullWindowRestore(model::Runtime &executor,
   std::cout << "full_window_restore=PASS\n";
 }
 
+// A chunk that crosses a boundary and captures its state in place publishes
+// the state a chunk ending there would: the teacher prefills [s, B) and
+// snapshots, the capturing lane prefills [s, E) once. The boundary lies past
+// the first window's wrap, so the rows after it overwrite window slots of
+// positions the state at B holds: the copy must come between the two stores.
+// B - s and E - s share every row-count plan (attention splits, MoE and
+// linear tiles: 480 and 512 rows are both eight of the router's 64-row
+// tiles), so the chunks compute the rows before B alike and the two states,
+// restored and carried over the same rows, match bit for bit; where states
+// differ, each part of the cell that does is reported first. Also: a
+// capture taken back to the pool is reusable, and a boundary the lane's draft
+// plan leaves without a complete window, or one off a page, is refused.
+void requireInPlaceStateCapture(model::Runtime &executor,
+                                const metal::MetalBackend &backend,
+                                const model::QwenStateStorage &states) {
+  constexpr uint32_t start = model::ExecutionLimits::draftContextTokens + 512;
+  constexpr uint32_t boundary = start + 480;
+  constexpr uint32_t end = start + 512;
+  std::vector<uint32_t> prompt(end + 64);
+  for (uint32_t index = 0; index < prompt.size(); ++index)
+    prompt[index] = 1 + (index * 7919) % 50000;
+  const std::span<const uint32_t> tokens(prompt);
+  const std::vector<uint32_t> pages = pageRange(0, prompt.size() / kv::kPageTokens);
+  const std::array<uint32_t, 1> planned{boundary};
+  const auto prefix = [&](uint64_t id) {
+    EngineRequest request = makeRequest(id, prompt, 1);
+    beginCold(executor, request, 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, prompt.size(), planned));
+    prefillChunk(executor, id, 0, tokens.first(model::ExecutionLimits::draftContextTokens), pages);
+    prefillChunk(executor, id, model::ExecutionLimits::draftContextTokens,
+                 tokens.subspan(model::ExecutionLimits::draftContextTokens,
+                                start - model::ExecutionLimits::draftContextTokens),
+                 pages);
+  };
+
+  prefix(120);
+  prefillChunk(executor, 120, start, tokens.subspan(start, boundary - start), pages);
+  const auto teacher = executor.snapshot(120);
+  require(teacher != nullptr, "teacher snapshot allocation failed");
+  executor.end(120);
+
+  prefix(121);
+  require(!executor.prepareStateCapture(121, boundary + 1), "a capture off a page boundary was prepared");
+  require(!executor.prepareStateCapture(121, start), "a capture at the lane's own length was prepared");
+  require(executor.prepareStateCapture(121, boundary), "the in-place capture was refused");
+  rejects([&] { static_cast<void>(executor.takeCapturedState(121)); },
+          "no prefill has written the Qwen state capture", "an unwritten capture was taken");
+  {
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{121, end - start}},
+                   .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = withRevision({.requestId = 121,
+                                        .logicalPosition = start,
+                                        .tokenCount = end - start,
+                                        .pageTable = pages});
+    item.inputTokens = tokens.subspan(start, end - start);
+    item.stateCapture = boundary;
+    auto result = executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {})->wait();
+    require(result.size() == 1 && result[0].failure.empty(), "the capturing chunk failed");
+  }
+  const auto captured = executor.takeCapturedState(121);
+  require(captured != nullptr, "the written capture was not taken");
+  executor.end(121);
+
+  // A capture let go of returns its buffers; the next takes them back.
+  prefix(122);
+  require(executor.prepareStateCapture(122, boundary), "a second capture was refused");
+  const uint32_t idle = states.idleCells();
+  executor.dropCapturedState(122);
+  require(states.idleCells() == idle + 1, "a dropped capture kept its cell");
+  require(executor.prepareStateCapture(122, boundary) && states.idleCells() == idle,
+          "a capture after a drop did not take the dropped cell back");
+  executor.end(122);
+  require(states.idleCells() == idle + 1 + model::CompositeStateLayout::kLaneGdnCells,
+          "ending a lane kept its capture's cell");
+
+  // Per GDN layer: the first layer whose carry or state differs, and how far.
+  const auto restored = [&](uint64_t id, const std::shared_ptr<const CompositeState> &state) {
+    EngineRequest request = makeRequest(id, prompt, 1);
+    beginCold(executor, request, 0);
+    restoreActivePrefix(executor, id, prompt.size(), boundary, state);
+    std::vector<std::vector<uint8_t>> layers;
+    const auto &cell = states.current(0);
+    for (uint32_t layer = 0; layer < cell.convolutionLayers.size(); ++layer)
+      for (const auto *buffer : {&cell.convolutionLayers[layer], &cell.recurrentLayers[layer]}) {
+        const auto *bytes = static_cast<const uint8_t *>(buffer->contents());
+        layers.emplace_back(bytes, bytes + buffer->sizeBytes());
+      }
+    const auto *window = static_cast<const uint8_t *>(states.window(0).contents());
+    layers.emplace_back(window, window + states.window(0).sizeBytes());
+    executor.end(id);
+    return layers;
+  };
+  {
+    const auto left = restored(125, teacher), right = restored(126, captured);
+    for (size_t index = 0; index < left.size(); ++index) {
+      if (left[index] == right[index])
+        continue;
+      size_t differing = 0;
+      for (size_t byte = 0; byte < left[index].size(); ++byte)
+        differing += left[index][byte] != right[index][byte];
+      std::cout << "capture_diff part=" << (index + 1 == left.size() ? std::string("window")
+                                            : std::string(index % 2 ? "recurrent" : "convolution") +
+                                                  std::to_string(index / 2))
+                << " bytes=" << differing << '/' << left[index].size() << '\n';
+    }
+  }
+  const auto carried = [&](uint64_t id, const std::shared_ptr<const CompositeState> &state) {
+    EngineRequest request = makeRequest(id, prompt, 1);
+    beginCold(executor, request, 0);
+    restoreActivePrefix(executor, id, prompt.size(), boundary, state);
+    prefillChunk(executor, id, boundary, tokens.subspan(boundary), pages);
+    auto samples = sampleCommittedState(backend, states, 0, boundary);
+    executor.end(id);
+    return samples;
+  };
+  compareCommittedSamples(carried(123, teacher), carried(124, captured));
+  std::cout << "in_place_state_capture=PASS\n";
+}
+
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
 // next transition reads, with 0xFF: NaN in either format, which the recurrence carries into
 // every row the lane computes. Non-finite KV would not do: the paged-attention
@@ -1697,7 +1817,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, stateCaptureOnly = false;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
@@ -1711,6 +1831,7 @@ int main(int argc, char **argv) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
+      else if (option == "--state-capture-only") stateCaptureOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
@@ -1915,6 +2036,11 @@ int main(int argc, char **argv) {
     require(static_cast<bool>(pages.allocateExtent(0)),
             "warmup runway fixture failed to recover its KV extent");
     while (states.releaseOneIdle(false)) {
+    }
+    if (stateCaptureOnly) {
+      requireInPlaceStateCapture(executor, backend, states);
+      std::cout << "PASS model-runtime-oracle scope=state-capture-only model=" << model.name() << '\n';
+      return 0;
     }
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
@@ -3847,6 +3973,7 @@ int main(int argc, char **argv) {
       std::cout << "discontinuous_capture_fails=PASS\n";
     }
     requireFullWindowRestore(executor, backend, states);
+    requireInPlaceStateCapture(executor, backend, states);
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
     for (uint32_t rows : {0U, model::ExecutionLimits::prefillTokenBudget + 1,

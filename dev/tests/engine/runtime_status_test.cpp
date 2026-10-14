@@ -86,6 +86,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.prioritySuspensions = 2;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
+  engine.inPlaceStatePublications = 3;
   engine.scheduler.waitingPrefix = 3;
   engine.diskStatePublications = 4;
   engine.scheduler.prefillBatches = 4;
@@ -339,6 +340,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           json.find("\"waiting_prefix\":3") != std::string::npos &&
           json.find("\"deduplicated_state_publications\":2,"
                     "\"recycled_state_publications\":1,"
+                    "\"in_place_state_publications\":3,"
                     "\"disk_state_publications\":4,") !=
               std::string::npos &&
           json.find("\"lazy_junctions\":1") != std::string::npos &&

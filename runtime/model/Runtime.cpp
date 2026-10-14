@@ -513,11 +513,11 @@ struct Runtime::Impl {
   // the rows kept for reuse past the cache's bytes: the state returned owns
   // them. Boundaries deeper inside an image keep only the embedding cache.
   std::shared_ptr<const CompositeState>
-  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state) {
+  holdStraddledRows(const Request &entry, std::shared_ptr<const CompositeState> state,
+                    uint64_t boundary) {
     std::erase_if(stateHolds, [](const std::weak_ptr<const HeldState> &hold) {
       return hold.expired();
     });
-    const uint64_t boundary = states.metadata(entry.stateLane).lengths.targetTokens;
     for (const ImageState &image : entry.images) {
       // The chunk that ended at the boundary encoded the image it reached.
       if (image.span.offset >= boundary || image.span.end() <= boundary)
@@ -1164,6 +1164,12 @@ struct Runtime::Impl {
       // decode step leaves without the rows it retained.
       if (metadata.pendingRows)
         throw std::logic_error("ragged prefill lane has decoded rows pending");
+      if (item.stateCapture &&
+          (item.stateCapture <= item.logicalPosition ||
+           item.stateCapture >= item.logicalPosition + item.tokenCount ||
+           !states.hasCapture(entry.stateLane) ||
+           states.captureTokens(entry.stateLane) != item.stateCapture))
+        throw std::logic_error("ragged prefill state capture was not prepared inside the chunk");
       if (item.logicalPosition == 0)
         states.clearForColdStart(entry.stateLane);
       if (item.tokenCount > kPrefillRows - batch.rows) {
@@ -1251,6 +1257,7 @@ struct Runtime::Impl {
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     for (const RaggedPrefillSequence &sequence : batch.sequences) {
+      const uint32_t first = spanCount;
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         DFlashPrefillSpan &span = spans.at(spanCount++);
         span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
@@ -1258,6 +1265,20 @@ struct Runtime::Impl {
         span.startPosition = capture.absoluteBegin;
         span.ring = states.draft(sequence.entry->stateLane);
         span.window = states.window(sequence.entry->stateLane);
+      }
+      // The window at a captured boundary: after the last span to store a
+      // row before it, splitting that span there. A boundary
+      // prepareStateCapture accepts has rows of the chunk before it, so such a
+      // span exists.
+      if (const uint64_t capture = sequence.item->stateCapture) {
+        DFlashPrefillSpan *last = nullptr;
+        for (uint32_t index = first; index < spanCount; ++index)
+          if (spans[index].startPosition < capture)
+            last = &spans[index];
+        if (!last)
+          throw std::logic_error("a captured boundary has no draft rows before it in its chunk");
+        last->windowSnapshot = states.capture(sequence.entry->stateLane).window->buffer();
+        last->snapshotPosition = static_cast<uint32_t>(capture);
       }
     }
     draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena), batch.capturedRows,
@@ -1315,6 +1336,8 @@ struct Runtime::Impl {
     std::vector<MetalBuffer> convolutionOut(stateBindingCount);
     std::vector<MetalBuffer> recurrentIn(stateBindingCount);
     std::vector<MetalBuffer> recurrentOut(stateBindingCount);
+    std::vector<MetalBuffer> convolutionSnapshot(stateBindingCount);
+    std::vector<MetalBuffer> recurrentSnapshot(stateBindingCount);
     for (uint32_t lane = 0; lane < batch.sequences.size(); ++lane) {
       const RaggedPrefillSequence &sequence = batch.sequences[lane];
       QwenTargetPrefillSequence &destination = modelSequences[lane];
@@ -1342,6 +1365,16 @@ struct Runtime::Impl {
         convolutionOut[stateBegin + layer] = out.convolutionLayers[layer];
         recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
         recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
+      }
+      if (const uint64_t capture = sequence.item->stateCapture) {
+        const GdnParityBuffers &cell = states.capture(sequence.entry->stateLane).gdn->buffers();
+        destination.snapshotRow = static_cast<uint32_t>(capture - sequence.item->logicalPosition);
+        destination.convolutionSnapshot = std::span(convolutionSnapshot).subspan(stateBegin, gdnLayers);
+        destination.recurrentSnapshot = std::span(recurrentSnapshot).subspan(stateBegin, gdnLayers);
+        for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
+          convolutionSnapshot[stateBegin + layer] = cell.convolutionLayers[layer];
+          recurrentSnapshot[stateBegin + layer] = cell.recurrentLayers[layer];
+        }
       }
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
@@ -2258,6 +2291,13 @@ Runtime::prefillAsync(const BatchPlan &plan,
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
       const uint64_t nextLength = item.logicalPosition + item.tokenCount;
+      // A capture is written with the chunk's state, and dropped with it.
+      if (item.stateCapture) {
+        if (finite[lane])
+          impl->states.markCaptureWritten(entry.stateLane);
+        else
+          impl->states.dropCapture(entry.stateLane);
+      }
       if (!finite[lane]) {
         // The chunk's state is not committed; the engine ends the request.
         entry.resultInvalid = true;
@@ -2474,7 +2514,52 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
       impl_->states.snapshot(residentLane(requestId));
   if (!state)
     return state;
-  return impl_->holdStraddledRows(impl_->request(requestId), std::move(state));
+  Impl::Request &entry = impl_->request(requestId);
+  return impl_->holdStraddledRows(entry, std::move(state),
+                                  impl_->states.metadata(entry.stateLane).lengths.targetTokens);
+}
+
+bool Runtime::prepareStateCapture(uint64_t requestId, uint32_t tokens) {
+  const uint32_t lane = residentLane(requestId);
+  Impl::Request &entry = impl_->request(requestId);
+  const QwenLogicalLengths &lengths = impl_->states.metadata(lane).lengths;
+  // A chunk from the lane's length past `tokens` captures it when the state
+  // there is one snapshot() would take: its draft rings, advanced by the
+  // chunk's captures before `tokens`, end at `tokens` with their window.
+  if (!entry.draftContextPlan || impl_->states.metadata(lane).pendingRows ||
+      tokens <= lengths.targetTokens || tokens % kv::kPageTokens)
+    return false;
+  // A boundary inside an image is left to the chunk that ends there, whose
+  // encode the state's held rows follow (holdStraddledRows).
+  if (std::ranges::any_of(entry.images, [&](const Impl::ImageState &image) {
+        return image.span.offset < tokens && tokens < image.span.end();
+      }))
+    return false;
+  QwenLogicalLengths at = lengths;
+  at.targetTokens = tokens;
+  for (const DispatchDraftCaptureSpan &capture : draftCaptureSpansForDispatch(
+           *entry.draftContextPlan, static_cast<uint32_t>(lengths.targetTokens), tokens))
+    at = Impl::advanceDraftContext(at, tokens, capture.absoluteBegin, capture.absoluteEnd,
+                                   capture.resetDraftState, true);
+  const uint32_t window = std::min(tokens, ExecutionLimits::draftContextTokens);
+  if (at != QwenLogicalLengths{tokens, tokens - window, window, tokens})
+    return false;
+  return impl_->states.beginCapture(lane, tokens);
+}
+
+std::shared_ptr<const CompositeState> Runtime::takeCapturedState(uint64_t requestId) {
+  const uint32_t lane = residentLane(requestId);
+  const uint32_t boundary = impl_->states.captureTokens(lane);
+  return impl_->holdStraddledRows(impl_->request(requestId), impl_->states.takeCapture(lane),
+                                  boundary);
+}
+
+void Runtime::dropCapturedState(uint64_t requestId) {
+  const auto found = impl_->requests.find(requestId);
+  if (found == impl_->requests.end() || !found->second.resident)
+    return;
+  if (impl_->states.hasCapture(found->second.stateLane))
+    impl_->states.dropCapture(found->second.stateLane);
 }
 
 uint64_t Runtime::snapshotBytes() const noexcept {

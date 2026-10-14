@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -256,6 +257,22 @@ public:
   // tier that accepts writes, or when the quota cannot admit another state.
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint32_t lane, std::function<void()> completion);
+  // A capture is a cached state's buffers that the lane's next prefill
+  // writes in place, the state after `tokens` rows, a page boundary its
+  // prefill crosses (QwenTargetPrefillSequence::snapshotRow): no copy
+  // follows. beginCapture takes the buffers as snapshot() does and returns
+  // false, with nothing taken, on capacity pressure. The prefill that wrote
+  // it marks it written; takeCapture then hands it over as a cached state
+  // with the lengths of a complete window at `tokens`, and dropCapture, or
+  // releasing the lane, returns its buffers to the pool. A lane holds at
+  // most one.
+  [[nodiscard]] bool beginCapture(uint32_t lane, uint32_t tokens);
+  [[nodiscard]] const QwenCachedBuffers &capture(uint32_t lane) const;
+  [[nodiscard]] bool hasCapture(uint32_t lane) const;
+  [[nodiscard]] uint32_t captureTokens(uint32_t lane) const;
+  void markCaptureWritten(uint32_t lane);
+  [[nodiscard]] std::shared_ptr<const QwenCompositeState> takeCapture(uint32_t lane);
+  void dropCapture(uint32_t lane);
   // Restores `state` into the lane's current cell, and into its context
   // window when restoreDraftState: the draft rings are computed from it
   // again (DFlashDraft::addContextRebuild). A RAM state is copied now, runs
@@ -288,10 +305,17 @@ private:
     std::shared_ptr<DFlashDraftRing> draft;
     std::shared_ptr<DFlashContextWindow> window;
   };
+  struct Capture final {
+    QwenCachedBuffers buffers;
+    QwenLogicalLengths lengths;
+    bool written = false;
+  };
   struct Lane final {
     QwenLaneMetadata metadata;
     Buffers cells;
+    std::optional<Capture> capture;
   };
+  [[nodiscard]] const Capture &heldCapture(uint32_t lane) const;
 
   [[nodiscard]] Lane &lane(uint32_t index);
   [[nodiscard]] const Lane &lane(uint32_t index) const;

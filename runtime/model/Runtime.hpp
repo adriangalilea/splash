@@ -43,6 +43,11 @@ public:
   [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] bool capturesStateInPlace() const noexcept override { return true; }
+  [[nodiscard]] bool prepareStateCapture(uint64_t requestId, uint32_t tokens) override;
+  [[nodiscard]] std::shared_ptr<const CompositeState>
+  takeCapturedState(uint64_t requestId) override;
+  void dropCapturedState(uint64_t requestId) override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>

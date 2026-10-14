@@ -148,6 +148,12 @@ struct DFlashPrefillSpan final {
   std::span<const DFlashDraftRingLayer> ring;
   // The lane's context window, which keeps the span's context rows.
   metal::MetalBuffer window;
+  // When set, the window as it stands once the rows of positions before
+  // snapshotPosition are stored and before any later one is: a cached
+  // state's window at that boundary, which the span's later rows would
+  // overwrite slots of. snapshotPosition is clamped into the span.
+  metal::MetalBuffer windowSnapshot;
+  uint32_t snapshotPosition = 0;
 };
 
 struct DFlashPrefillBuffers final {

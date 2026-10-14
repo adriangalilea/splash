@@ -2087,6 +2087,29 @@ a restore that continues the rings computes them from the window again at the
 start of the request's first prefill chunk (`DFlashDraft::addContextRebuild`).
 Decode writes the rings alone, so states are published only in prefill.
 
+A prefill command ends at each planned state boundary, where the engine copies
+the lane's state into a cached state's buffers (`Model::snapshot`), except at
+the prompt's replay boundary when it is the last one planned: there the command
+that crosses it writes the state in place (`Model::prepareStateCapture`,
+`ModelBatchItem::stateCapture`), sparing the copy and a second command, a pass
+over every layer's weights, for the prompt's last rows (under a page and the
+generation prompt). The GDN prepare and scan kernels store
+the convolution carry and the recurrent state after the boundary's row into the
+cached state's cell as well as running on (`GDNPrefillParams::snapshot_row`),
+and the draft's window store for that chunk splits at the boundary, the window
+copied between its halves (`DFlashPrefillSpan::windowSnapshot`): the rows after
+the boundary overwrite slots of positions the state at the boundary holds. A
+capture needs the cached state's buffers before the command: when the pool and
+the governor have none, or the boundary lies inside an image, the command ends
+at the boundary as before. The rows before the boundary are computed in a longer
+chunk than the command that would have ended there, so where a row-count plan
+differs (a linear tile, attention splits) the state differs from that command's
+in its last bits, as any other chunking does; it stays consistent with the KV
+the same command wrote. `/status` counts these as
+`cache.in_place_state_publications`; `model-runtime-oracle
+--state-capture-only` compares one, at row counts that share every plan, with a
+snapshot bit for bit.
+
 ### Disk tier
 
 The tier holds cached request states (GDN cell plus the draft's context

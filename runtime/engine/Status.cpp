@@ -238,6 +238,7 @@ std::string runtimeStatusJson(
       << core.deduplicatedStatePublications
       << ",\"recycled_state_publications\":"
       << core.recycledStatePublications
+      << ",\"in_place_state_publications\":" << core.inPlaceStatePublications
       << ",\"disk_state_publications\":" << core.diskStatePublications
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures

@@ -52,6 +52,10 @@ struct EngineConfig final {
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
+  // The prompt's replay boundary is captured inside the prefill command that
+  // crosses it (Model::prepareStateCapture) where the model can, instead of
+  // ending a command there; false keeps every boundary a command's end.
+  bool inPlaceStateCapture = true;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's snapshot
   // is denied: while growth is paused, extents released for it cannot hold
@@ -157,6 +161,9 @@ struct EngineSnapshot final {
   uint64_t deduplicatedStatePublications = 0;
   // Publications completed after reclaiming a cached state.
   uint64_t recycledStatePublications = 0;
+  // Publications of a state the command that crossed its boundary captured
+  // in place, with no command ending there.
+  uint64_t inPlaceStatePublications = 0;
   // Publications written straight to disk because no cache slot was free.
   uint64_t diskStatePublications = 0;
   uint64_t replayStatePublicationFailures = 0;
@@ -326,6 +333,8 @@ private:
     std::optional<CacheProbe> admissionProbe;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
+    // The boundary the command in flight captures in place, 0 for none.
+    uint32_t stateCapture = 0;
     StateCheckpoint latestCheckpoint;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
@@ -413,8 +422,13 @@ private:
   [[nodiscard]] DraftContextPlan
   pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
   // Arms the next planned boundary, if any, with the scheduler: after
-  // admission, and after the scheduler has taken a command's progress.
+  // admission, and after the scheduler has taken a command's progress. A
+  // boundary a command may capture in place is not armed.
   void armNextStateBoundary(Request &request);
+  // The next planned boundary when a command may cross it and capture its
+  // state in place: the last one planned, the prompt's replay point of a
+  // request that replays only its prompt.
+  [[nodiscard]] std::optional<uint32_t> capturableBoundary(const Request &request) const;
   void discardPendingStateBoundaries(Request &request) noexcept;
   // Another unfinished lane holds this lane's recovery point as its own.
   [[nodiscard]] bool checkpointShared(const Request &request) const;

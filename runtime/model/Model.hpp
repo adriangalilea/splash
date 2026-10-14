@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -315,6 +316,10 @@ struct ModelBatchItem final {
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
   std::span<const uint32_t> inputTokens{};
+  // A prefill chunk's in-place state capture (Model::prepareStateCapture):
+  // the absolute boundary, logicalPosition < stateCapture < logicalPosition
+  // + tokenCount, whose state the chunk also writes; 0 for none.
+  uint64_t stateCapture = 0;
 };
 
 struct ModelStepResult final {
@@ -567,6 +572,23 @@ public:
   // and retry.
   [[nodiscard]] virtual std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
+  // The state at `tokens`, a page boundary the request's next prefill chunk
+  // crosses, captured by that chunk itself (ModelBatchItem::stateCapture)
+  // instead of by snapshot() between two chunks. prepareStateCapture takes a
+  // cached state's buffers for it; false, with nothing taken, when the model
+  // cannot capture there or the pool has no buffers to spare, and the caller
+  // ends the chunk at the boundary instead. Once the chunk completes,
+  // takeCapturedState returns the cached state snapshot() would have at the
+  // boundary; dropCapturedState lets go of a capture not taken. A request
+  // holds one capture at a time, and ending or suspending it drops it. A
+  // model that never captures says so, and its boundaries end commands.
+  [[nodiscard]] virtual bool capturesStateInPlace() const noexcept { return false; }
+  [[nodiscard]] virtual bool prepareStateCapture(uint64_t, uint32_t) { return false; }
+  [[nodiscard]] virtual std::shared_ptr<const CompositeState>
+  takeCapturedState(uint64_t) {
+    throw std::logic_error("the model captures no state in place");
+  }
+  virtual void dropCapturedState(uint64_t) {}
   // The cached states whose eviction would return to the pool what a lane's
   // activation still has to allocate: zero when the pool holds a lane's
   // buffers, and the maximum when no number of states does (a buffer no

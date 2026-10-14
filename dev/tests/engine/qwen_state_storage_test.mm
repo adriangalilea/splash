@@ -464,6 +464,77 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   storage.releaseLane(0, 7);
 }
 
+// A capture is a cached state's buffers a prefill writes in place: taken as
+// a snapshot takes them, refused with nothing taken when the governor denies
+// them, handed over as a cached state with a published state's lengths once
+// written, and returned to the pool when dropped or when its lane goes.
+void testInPlaceCapture(metal::MetalBackend &backend) {
+  constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128}, {1, 1, 4, 128}};
+  bool deny = false;
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
+  const metal::AllocationAdmission admit = governor.allocationAdmission();
+  model::QwenStateStorage storage(
+      backend,
+      [&](uint64_t bytes, const std::function<void()> &allocate) -> metal::AllocationResult {
+        if (deny)
+          return metal::AllocationFailure::EngineBudget;
+        return admit(bytes, allocate);
+      },
+      layout, nullptr);
+  require(static_cast<bool>(storage.tryActivateLane(0, 1)) &&
+              static_cast<bool>(storage.tryActivateLane(1, 2)),
+          "capture lanes did not activate");
+  storage.updateLengths(0, published(2048));
+  storage.updateLengths(1, published(2048));
+
+  deny = true;
+  require(!storage.beginCapture(0, 4096) && !storage.hasCapture(0),
+          "a denied capture took buffers");
+  deny = false;
+  rejects([&] { static_cast<void>(storage.beginCapture(0, 4100)); },
+          "composite snapshot requires equal page-aligned committed lengths",
+          "a capture off a page was taken");
+  rejects([&] { static_cast<void>(storage.capture(0)); }, "the Qwen lane holds no state capture",
+          "a lane without a capture handed out buffers");
+
+  require(storage.beginCapture(0, 4096) && storage.hasCapture(0) &&
+              storage.captureTokens(0) == 4096,
+          "the capture was not taken");
+  rejects([&] { static_cast<void>(storage.beginCapture(0, 4096)); },
+          "a Qwen lane holds one state capture at a time", "a second capture was taken");
+  const model::QwenCachedBuffers &buffers = storage.capture(0);
+  fill(buffers.gdn->buffers().stateBase, 31);
+  fill(buffers.window->buffer(), 37);
+  const std::vector<std::vector<uint8_t>> written{bytesOf(buffers.gdn->buffers().stateBase),
+                                                  bytesOf(buffers.window->buffer())};
+  rejects([&] { static_cast<void>(storage.takeCapture(0)); },
+          "no prefill has written the Qwen state capture", "an unwritten capture was taken");
+  storage.markCaptureWritten(0);
+  const std::shared_ptr<const model::QwenCompositeState> state = storage.takeCapture(0);
+  require(state && !storage.hasCapture(0) && state->bytes() == layout.cachedBytes(),
+          "the written capture was not handed over");
+  bool committed = false;
+  require(!storage.beginRestore(1, *state, true, {}, [&] { committed = true; }) && committed,
+          "the captured state did not restore");
+  require(stateImage(storage, 1) == written && storage.metadata(1).lengths == published(4096),
+          "the captured state restored other bytes or lengths");
+
+  require(storage.beginCapture(0, 4096), "a second capture after a take was refused");
+  const uint32_t cells = storage.idleCells(), windows = storage.idleWindows();
+  storage.dropCapture(0);
+  require(!storage.hasCapture(0) && storage.idleCells() == cells + 1 &&
+              storage.idleWindows() == windows + 1,
+          "a dropped capture kept its buffers");
+  const uint32_t idle = storage.idleCells();
+  require(storage.beginCapture(0, 4096) && storage.idleCells() + 1 == idle,
+          "a capture did not take the dropped cell back");
+  storage.releaseLane(0, 1);
+  require(storage.idleCells() == idle + model::CompositeStateLayout::kLaneGdnCells,
+          "releasing a lane kept its capture's cell");
+  storage.releaseLane(1, 2);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -477,6 +548,7 @@ void run(const std::string &metallib) {
   testStateSmallerThanSlot(backend);
   testPersistentStateComesBack(backend);
   testPersistKeepsTheRamCopy(backend);
+  testInPlaceCapture(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
       queryHostAvailableMemory, 0);

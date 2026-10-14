@@ -297,6 +297,8 @@ void QwenStateStorage::releaseLane(uint32_t index, uint64_t requestId) {
   if (!requestId || current.metadata.requestId != requestId) {
     throw std::logic_error("Qwen lane owner mismatch");
   }
+  if (current.capture)
+    dropCapture(index);
   // Parity one first, so the next activation pops parity zero first and a
   // reactivated lane gets its previous buffers back in the same order.
   for (uint32_t parity = current.cells.gdn.size(); parity > 0;) {
@@ -423,6 +425,63 @@ QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completio
                                    stateSpans(current(index), window(index)),
                                    layout_, source.metadata.lengths,
                                    std::move(completion));
+}
+
+bool QwenStateStorage::beginCapture(uint32_t index, uint32_t tokens) {
+  Lane &target = lane(index);
+  requireAssigned(target);
+  if (target.capture)
+    throw std::logic_error("a Qwen lane holds one state capture at a time");
+  const uint32_t window = std::min(tokens, ExecutionLimits::draftContextTokens);
+  const QwenLogicalLengths lengths{tokens, tokens - window, window, tokens};
+  validateLengths(lengths, true);
+  Buffers buffers;
+  if (!acquire(1, false, "qwen-state-capture", buffers))
+    return false;
+  target.capture = Capture{{std::move(buffers.gdn[0]), std::move(buffers.window)}, lengths, false};
+  return true;
+}
+
+const QwenStateStorage::Capture &QwenStateStorage::heldCapture(uint32_t index) const {
+  const Lane &target = lane(index);
+  requireAssigned(target);
+  if (!target.capture)
+    throw std::logic_error("the Qwen lane holds no state capture");
+  return *target.capture;
+}
+
+const QwenCachedBuffers &QwenStateStorage::capture(uint32_t index) const {
+  return heldCapture(index).buffers;
+}
+
+bool QwenStateStorage::hasCapture(uint32_t index) const {
+  return lane(index).capture.has_value();
+}
+
+uint32_t QwenStateStorage::captureTokens(uint32_t index) const {
+  return static_cast<uint32_t>(heldCapture(index).lengths.targetTokens);
+}
+
+void QwenStateStorage::markCaptureWritten(uint32_t index) {
+  (void)heldCapture(index);
+  lane(index).capture->written = true;
+}
+
+std::shared_ptr<const QwenCompositeState> QwenStateStorage::takeCapture(uint32_t index) {
+  if (!heldCapture(index).written)
+    throw std::logic_error("no prefill has written the Qwen state capture");
+  Capture taken = std::move(*lane(index).capture);
+  lane(index).capture.reset();
+  return std::shared_ptr<const QwenCompositeState>(new QwenCompositeState(
+      pool_, std::move(taken.buffers), layout_, taken.lengths, file_, staging_));
+}
+
+void QwenStateStorage::dropCapture(uint32_t index) {
+  (void)heldCapture(index);
+  Capture dropped = std::move(*lane(index).capture);
+  lane(index).capture.reset();
+  pool_->cells.push_back(std::move(dropped.buffers.gdn));
+  pool_->windows.push_back(std::move(dropped.buffers.window));
 }
 
 metal::AllocationResult
