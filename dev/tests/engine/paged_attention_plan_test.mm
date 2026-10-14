@@ -85,7 +85,8 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   for (uint32_t rows = 1; rows <= 2048; ++rows) {
     const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
     const uint32_t tiles = (rows + 7) / 8;
-    const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+    // A chunk shares the full chunk's 256 tile slots over its own tiles.
+    const uint32_t splits = std::clamp(256U / tiles, 1U, 32U);
     require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
     require(plan.splitPipeline == prefillSplit && plan.reducePipeline == prefillReduce,
             "prefill plan runs the wrong pipelines");
